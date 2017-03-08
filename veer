@@ -1,0 +1,138 @@
+#!/bin/bash
+
+ovpn_config_path=$1
+domain=$2
+
+log() {
+  echo -e "| $1"
+}
+
+usage() {
+  log "Usage:"
+  echo "veer <ovpn.conf> <www.domain.com>"
+}
+
+check_exe() {
+  if (hash "$1 2>/dev/null"); then
+    log "$1 is present."
+  else
+    log "$1 missing!"
+
+    exit 1
+  fi
+}
+
+get_domain_ips() {
+  dig $1 +short
+}
+
+check_config() {
+  if ! [ -e $ovpn_config_path ]; then
+    log "OpenVPN config not found at $ovpn_config_path!"
+
+    exit 1
+  fi
+
+  if (grep '^redirect-gateway' $ovpn_config_path); then
+    log "Remove 'redirect-gateway' from the OpenVPN config file, as it routes *all* traffic to the VPN!"
+
+    exit 1
+  fi
+
+  if (grep '^keepalive' $ovpn_config_path); then
+    log "Remove 'keepalive' from the OpenVPN config file, to avoid the recreation of the TUN device and the loss of routes!"
+
+    exit 1
+  fi
+
+  if (grep '^ping-restart=0' $ovpn_config_path); then
+    log "Remove 'ping-restart' from the OpenVPN config file, to avoid losing the route configuration!"
+
+    exit 1
+  fi
+
+  log "Config OK"
+}
+
+
+get_tun_info() {
+  route | grep -e 'UH.*tun'
+}
+
+kill_openvpn() {
+  pgrep -f "[o]penvpn.*$ovpn_config_path" | xargs -I PID sudo kill PID
+}
+
+start_openvpn() {
+  sudo openvpn --daemon --ping 10 --ping-restart 0 --persist-tun --config $ovpn_config_path
+
+  if [ $? -eq 1 ]; then
+    log "OpenVPN failed to start!"
+    log "Printing OpenVPN log"
+
+    grep -E "openvpn" /var/log/syslog | tail -n 20
+
+    exit 1
+  fi
+
+  log "Waiting for the TUN device to appear"
+
+  # test connection to the VPN gateway with 'nc' instead
+  while true; do
+    local tun_info=$(get_tun_info)
+
+    ! [ -z "$tun_info" ] && break
+
+    printf "."
+    sleep 2
+  done
+
+  printf "\n"
+}
+
+route_domain_trough_vpn() {
+  log "Fetching VPN gateway"
+  local vpn_gateway=$(fetch_vpn_gateway)
+
+  log "Fetching IPs for $domain"
+  local ips=$(get_domain_ips $domain)
+
+  # the new routes will be auto-cleaned up after the TUN device is destroyed
+  for ip in $ips; do
+    log "$ip ($domain) -> $vpn_gateway (VPN GW)"
+    sudo route add $ip gw $vpn_gateway
+  done
+
+  log "Done"
+}
+
+fetch_vpn_gateway() {
+  # doesn't work when there are multiple TUN devices [WIP]
+  get_tun_info | cut -d ' ' -f1
+}
+
+#######
+
+if [ "$#" -ne 2 ]; then
+  usage
+
+  exit 1
+fi
+
+log "Checking requirements"
+check_exe "openvpn"
+check_exe "dig"
+
+log "Verifying OpenVPN config file"
+check_config
+
+log "Cleaning leftover OpenVPN instances if present"
+kill_openvpn
+
+log "Starting OpenVPN client"
+start_openvpn
+
+log "Routing domain IPs to VPN gateway"
+route_domain_trough_vpn
+
+log "Open $domain and enjoy!"
